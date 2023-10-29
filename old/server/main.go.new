@@ -1,0 +1,154 @@
+package main
+
+import (
+	"flag"
+	"io"
+	"libs"
+	"log"
+	"math"
+	"net"
+	"strconv"
+	"time"
+)
+
+/* Exported vars */
+var Speed_Upstream float64 // units kb/s
+var Speed_Downstream float64
+var Data_Upstream int64 // units bytes
+var Data_Downstream int64
+
+/* private vars for local use */
+var recorded_time time.Time
+var timeout int64
+
+func main() {
+
+	/* cmd args setting */
+	socks5Port := flag.String("portSocks5", "6000", "The port number for socks5 requests")
+	flag.Int64Var(&timeout, "timeout", 30, "The duration (units: sec) to keep the current connection alive")
+	flag.Parse()
+
+	/* listen on the specified port */
+	l, err := net.Listen("tcp", ":"+*socks5Port)
+	if err != nil {
+		log.Fatal("failed to listen on port ", *socks5Port, err)
+	}
+	log.Printf("Listening on port %s, for socks5 requests\n", *socks5Port)
+
+	/* accept the incoming request */
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("Accepted a new connection: %v\n", conn.RemoteAddr())
+		go handleSocks5Request(conn)
+	}
+}
+
+func handleSocks5Request(conn net.Conn) {
+	defer conn.Close()
+	// negotiation
+	var buf [256]byte
+	n, err := conn.Read(buf[:])
+	if err != nil {
+		log.Printf("[Negotiation stage] Reading the header error, close the connection - %v\n", conn.RemoteAddr())
+		return
+	}
+	var neo_header libs.ProtocolVersion
+	resp, err := neo_header.HandleHandshake(buf[:n])
+	_, err = conn.Write(resp)
+	if err != nil {
+		log.Printf("[Negotiation stage] Wrting the response error, close the connection - %v\n", conn.RemoteAddr())
+		return
+	}
+
+	// connection
+	n, err = conn.Read(buf[:])
+	if err != nil {
+		log.Printf("[Connection stage] Reading the header error, close the connection - %v\n", conn.RemoteAddr())
+		return
+	}
+	var connection libs.Socks5Resolution
+	resp, err = connection.LSTRequest(buf[0:n])
+	_, err = conn.Write(resp)
+	if err != nil {
+		log.Printf("[Connection stage] Wrting the response error, close the connection - %v\n", conn.RemoteAddr())
+		return
+	}
+
+	log.Printf("[Connection summary] Client: %v; DstDomain: %v, DSTAddr: %v, DSTPort: %v\n",
+		conn.RemoteAddr(), connection.DSTDOMAIN, connection.DSTADDR, connection.DSTPORT)
+
+	// relay
+	dst_addrport := connection.DSTDOMAIN + ":" + strconv.FormatUint(uint64(connection.DSTPORT), 10)
+	dst_conn, err := net.Dial("tcp", dst_addrport)
+	if err != nil {
+		log.Printf("Failed to connect dst server \n")
+		return
+	}
+	defer dst_conn.Close()
+
+	relayInfo(conn, dst_conn)
+}
+
+func relayInfo(src net.Conn, dst net.Conn) {
+	/* copy from src to dst */
+	go replayUpstream(src, dst)
+
+	/* copy from dst to src */
+	for {
+
+		dst.SetReadDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
+		t_downstream := time.Now()
+		n, err := io.Copy(src, dst)
+		dur_downstream := time.Since(t_downstream)
+		if err != nil {
+			log.Printf("[Timeout] We're going to close the connection. Client: %v", src.RemoteAddr())
+			log.Println(err)
+			return
+		}
+		if n > 0 {
+			log.Printf("[Relay Downstram: Num copied ]The n is %v\n:", n)
+			go updateDownstream(n, dur_downstream)
+		}
+	}
+}
+
+func replayUpstream(src net.Conn, dst net.Conn) {
+	for {
+		tUpstream := time.Now()
+		n, err := io.Copy(dst, src)
+		durUpstream := time.Since(tUpstream)
+		if err != nil {
+			log.Println(err)
+			return
+		}
+		if n > 0 {
+			log.Printf("[relayUpstream: Num copied]The n is %v\n:", n)
+			go updateUpstream(n, durUpstream)
+		}
+	}
+
+}
+
+func updateDownstream(bytesTransmitted int64, duration time.Duration) {
+	/* calculate the speed */
+	Speed_Downstream = (float64(bytesTransmitted) / 1024) / (float64(duration.Nanoseconds()) * math.Pow(10, -9))
+	log.Printf("[Speed: Downstream] The recent downstream speed is %.2f kb/s\n", Speed_Downstream)
+
+	/* update vars */
+	Data_Downstream += bytesTransmitted
+	log.Printf("[Cumulative Data: DownStream]:  %v bytes\n", Data_Downstream)
+
+}
+
+func updateUpstream(numBytes int64, duration time.Duration) {
+	/* calculate the speed */
+	Speed_Upstream = (float64(numBytes) / 1024) / (float64(duration.Nanoseconds()) * math.Pow(10, -9))
+	log.Printf("[Speed: Upstream] The recent upstream speed is %.2f kb/s\n", Speed_Upstream)
+
+	/* update vars */
+	Data_Upstream += numBytes
+	log.Printf("[Cumulative Data: UpStream]:  %v bytes\n", Data_Upstream)
+}
