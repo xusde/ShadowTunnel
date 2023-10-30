@@ -56,7 +56,7 @@
 ### Built With
 
 - GO
-- React
 - Wails
 - Typescript
+- React
 - MaterialUI
